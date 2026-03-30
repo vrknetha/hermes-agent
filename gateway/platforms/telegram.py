@@ -182,21 +182,47 @@ class TelegramAdapter(BasePlatformAdapter):
         return prefixes
 
     def _text_mentions_bot(self, text: str) -> bool:
-        """Return True when text contains @<bot_username> mention."""
+        """Return True when text contains a direct @<bot_username> mention."""
         if not text or not self._bot_username:
             return False
-        pattern = rf"(?<!\w)@{re.escape(self._bot_username)}\b"
-        return re.search(pattern, text, flags=re.IGNORECASE) is not None
+        username = re.escape(self._bot_username)
+        mention_pattern = rf"(?<!\w)@{username}\b"
+        return re.search(mention_pattern, text, flags=re.IGNORECASE) is not None
 
     def _strip_bot_mentions(self, text: str) -> str:
         """Strip @<bot_username> mention tokens from text."""
         if not text or not self._bot_username:
             return text
-        pattern = rf"(?<!\w)@{re.escape(self._bot_username)}\b"
-        stripped = re.sub(pattern, "", text, flags=re.IGNORECASE)
+        username = re.escape(self._bot_username)
+        mention_pattern = rf"(?<!\w)@{username}\b"
+        stripped = re.sub(mention_pattern, "", text, flags=re.IGNORECASE)
         stripped = re.sub(r"[ \t]{2,}", " ", stripped)
         stripped = re.sub(r"[ \t]*\n[ \t]*", "\n", stripped)
         return stripped.strip()
+
+    @staticmethod
+    def _extract_command_target(text: str) -> Optional[str]:
+        """Extract explicit bot target from '/command@target' syntax."""
+        if not text:
+            return None
+        match = re.match(r"^\s*/[^\s@]+@([A-Za-z0-9_]+)\b", text)
+        if not match:
+            return None
+        return match.group(1)
+
+    def _strip_command_target(self, text: str) -> str:
+        """Normalize '/command@<this_bot>' into '/command'."""
+        if not text or not self._bot_username:
+            return text
+        username = re.escape(self._bot_username)
+        stripped = re.sub(
+            rf"(^\s*/[^\s@]+)@{username}\b",
+            r"\1",
+            text,
+            count=1,
+            flags=re.IGNORECASE,
+        )
+        return stripped
 
     def _message_mentions_bot(self, message: Optional[Message], fallback_text: str = "") -> bool:
         """Return True when the Telegram message mentions this bot."""
@@ -272,6 +298,13 @@ class TelegramAdapter(BasePlatformAdapter):
             return True
 
         event_text = event.text or ""
+        command_target = self._extract_command_target(event_text)
+        if command_target:
+            if self._bot_username and command_target.lower() == self._bot_username.lower():
+                event.text = self._strip_command_target(event_text).strip()
+                return True
+            return False
+
         if self._message_mentions_bot(message, event_text):
             event.text = self._strip_bot_mentions(event_text)
             return True

@@ -165,6 +165,38 @@ async def test_group_command_without_targeting_is_ignored_when_strict(adapter):
 
 
 @pytest.mark.asyncio
+async def test_group_command_with_bot_suffix_is_treated_as_targeted(adapter):
+    update = _make_update(_make_message(text="/status@hermesbot", chat_type="group"))
+
+    await adapter._handle_command(update, MagicMock())
+
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.text == "/status"
+
+
+@pytest.mark.asyncio
+async def test_group_command_with_bot_suffix_is_case_insensitive(adapter):
+    adapter._bot_username = "otherbot"
+    update = _make_update(_make_message(text="/status@OtherBot", chat_type="group"))
+
+    await adapter._handle_command(update, MagicMock())
+
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.text == "/status"
+
+
+@pytest.mark.asyncio
+async def test_group_command_targeting_other_bot_is_ignored(adapter):
+    update = _make_update(_make_message(text="/status@otherbot", chat_type="group"))
+
+    await adapter._handle_command(update, MagicMock())
+
+    adapter.handle_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_dm_message_is_processed_without_mention(adapter):
     update = _make_update(_make_message(text="hello in dm", chat_type="private"))
 
