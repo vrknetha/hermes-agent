@@ -8,6 +8,7 @@ Uses python-telegram-bot library for:
 """
 
 import asyncio
+import json
 import logging
 import os
 import re
@@ -122,6 +123,8 @@ class TelegramAdapter(BasePlatformAdapter):
         super().__init__(config, Platform.TELEGRAM)
         self._app: Optional[Application] = None
         self._bot: Optional[Bot] = None
+        self._webhook_mode: bool = False
+        self._mention_patterns = self._compile_mention_patterns()
         self._reply_to_mode: str = getattr(config, 'reply_to_mode', 'first') or 'first'
         # Buffer rapid/album photo updates so Telegram image bursts are handled
         # as a single MessageEvent instead of self-interrupting multiple turns.
@@ -181,19 +184,43 @@ class TelegramAdapter(BasePlatformAdapter):
             prefixes.append(prefix)
         return prefixes
 
+    def _resolved_bot_username(self) -> Optional[str]:
+        """Return normalized bot username from cached identity or bot object."""
+        cached_username = getattr(self, "_bot_username", None)
+        if isinstance(cached_username, str) and cached_username:
+            return cached_username.lstrip("@").lower()
+        bot = getattr(self, "_bot", None)
+        bot_username = getattr(bot, "username", None) if bot else None
+        if isinstance(bot_username, str) and bot_username:
+            return bot_username.lstrip("@").lower()
+        return None
+
+    def _resolved_bot_user_id(self) -> Optional[str]:
+        """Return bot user id from cached identity or bot object."""
+        cached_user_id = getattr(self, "_bot_user_id", None)
+        if cached_user_id is not None:
+            return str(cached_user_id)
+        bot = getattr(self, "_bot", None)
+        bot_id = getattr(bot, "id", None) if bot else None
+        if bot_id is not None:
+            return str(bot_id)
+        return None
+
     def _text_mentions_bot(self, text: str) -> bool:
         """Return True when text contains a direct @<bot_username> mention."""
-        if not text or not self._bot_username:
+        bot_username = self._resolved_bot_username()
+        if not text or not bot_username:
             return False
-        username = re.escape(self._bot_username)
+        username = re.escape(bot_username)
         mention_pattern = rf"(?<!\w)@{username}\b"
         return re.search(mention_pattern, text, flags=re.IGNORECASE) is not None
 
     def _strip_bot_mentions(self, text: str) -> str:
         """Strip @<bot_username> mention tokens from text."""
-        if not text or not self._bot_username:
+        bot_username = self._resolved_bot_username()
+        if not text or not bot_username:
             return text
-        username = re.escape(self._bot_username)
+        username = re.escape(bot_username)
         mention_pattern = rf"(?<!\w)@{username}\b"
         stripped = re.sub(mention_pattern, "", text, flags=re.IGNORECASE)
         stripped = re.sub(r"[ \t]{2,}", " ", stripped)
@@ -212,9 +239,10 @@ class TelegramAdapter(BasePlatformAdapter):
 
     def _strip_command_target(self, text: str) -> str:
         """Normalize '/command@<this_bot>' into '/command'."""
-        if not text or not self._bot_username:
+        bot_username = self._resolved_bot_username()
+        if not text or not bot_username:
             return text
-        username = re.escape(self._bot_username)
+        username = re.escape(bot_username)
         stripped = re.sub(
             rf"(^\s*/[^\s@]+)@{username}\b",
             r"\1",
@@ -228,6 +256,8 @@ class TelegramAdapter(BasePlatformAdapter):
         """Return True when the Telegram message mentions this bot."""
         if message is None:
             return self._text_mentions_bot(fallback_text)
+        bot_username = self._resolved_bot_username()
+        bot_user_id = self._resolved_bot_user_id()
 
         candidates: List[str] = []
         text = getattr(message, "text", None)
@@ -251,30 +281,143 @@ class TelegramAdapter(BasePlatformAdapter):
                 raw_entity_type = getattr(entity, "type", "")
                 entity_type_value = getattr(raw_entity_type, "value", raw_entity_type)
                 entity_type = str(entity_type_value).lower()
-                if (entity_type == "mention" or entity_type.endswith(".mention")) and self._bot_username:
+                if (entity_type == "mention" or entity_type.endswith(".mention")) and bot_username:
                     offset = int(getattr(entity, "offset", 0))
                     length = int(getattr(entity, "length", 0))
                     mention = source_text[offset:offset + length]
-                    if mention.lower() == f"@{self._bot_username.lower()}":
+                    if mention.lower() == f"@{bot_username}":
                         return True
-                if (entity_type == "text_mention" or entity_type.endswith(".text_mention")) and self._bot_user_id:
+                if (entity_type == "text_mention" or entity_type.endswith(".text_mention")) and bot_user_id:
                     user = getattr(entity, "user", None)
                     user_id = getattr(user, "id", None) if user else None
-                    if user_id is not None and str(user_id) == str(self._bot_user_id):
+                    if user_id is not None and str(user_id) == bot_user_id:
                         return True
 
         return any(self._text_mentions_bot(candidate) for candidate in candidates)
 
     def _is_reply_to_bot(self, message: Optional[Message]) -> bool:
         """Return True when the incoming message replies to a bot-authored message."""
-        if message is None or not self._bot_user_id:
+        bot_user_id = self._resolved_bot_user_id()
+        if message is None or not bot_user_id:
             return False
         reply_to = getattr(message, "reply_to_message", None)
         if not reply_to:
             return False
         reply_user = getattr(reply_to, "from_user", None)
         reply_user_id = getattr(reply_user, "id", None) if reply_user else None
-        return reply_user_id is not None and str(reply_user_id) == str(self._bot_user_id)
+        return reply_user_id is not None and str(reply_user_id) == bot_user_id
+
+    def _telegram_free_response_chats(self) -> set[str]:
+        """Return chat IDs that bypass strict group mention gating."""
+        raw = self.config.extra.get("free_response_chats")
+        if raw is None:
+            raw = os.getenv("TELEGRAM_FREE_RESPONSE_CHATS", "")
+        if isinstance(raw, list):
+            return {str(part).strip() for part in raw if str(part).strip()}
+        return {part.strip() for part in str(raw).split(",") if part.strip()}
+
+    def _compile_mention_patterns(self) -> List[re.Pattern]:
+        """Compile optional regex wake-word patterns for group triggers."""
+        patterns = self.config.extra.get("mention_patterns")
+        if patterns is None:
+            raw = os.getenv("TELEGRAM_MENTION_PATTERNS", "").strip()
+            if raw:
+                try:
+                    patterns = json.loads(raw)
+                except Exception:
+                    loaded = [part.strip() for part in raw.splitlines() if part.strip()]
+                    if not loaded:
+                        loaded = [part.strip() for part in raw.split(",") if part.strip()]
+                    patterns = loaded
+
+        if patterns is None:
+            return []
+        if isinstance(patterns, str):
+            patterns = [patterns]
+        if not isinstance(patterns, list):
+            logger.warning(
+                "[%s] telegram mention_patterns must be a list or string; got %s",
+                self.name,
+                type(patterns).__name__,
+            )
+            return []
+
+        compiled: List[re.Pattern] = []
+        for pattern in patterns:
+            if not isinstance(pattern, str) or not pattern.strip():
+                continue
+            try:
+                compiled.append(re.compile(pattern, re.IGNORECASE))
+            except re.error as exc:
+                logger.warning("[%s] Invalid Telegram mention pattern %r: %s", self.name, pattern, exc)
+        if compiled:
+            logger.info("[%s] Loaded %d Telegram mention pattern(s)", self.name, len(compiled))
+        return compiled
+
+    def _message_matches_mention_patterns(self, message: Optional[Message], fallback_text: str = "") -> bool:
+        if not self._mention_patterns:
+            return False
+        candidates: List[str] = []
+        if message is not None:
+            text = getattr(message, "text", None)
+            caption = getattr(message, "caption", None)
+            if text:
+                candidates.append(text)
+            if caption:
+                candidates.append(caption)
+        if fallback_text:
+            candidates.append(fallback_text)
+        for candidate in candidates:
+            for pattern in self._mention_patterns:
+                if pattern.search(candidate):
+                    return True
+        return False
+
+    def _is_group_message(self, message: Optional[Message]) -> bool:
+        if not message:
+            return False
+        chat = getattr(message, "chat", None)
+        if not chat:
+            return False
+        chat_type = str(getattr(chat, "type", "")).split(".")[-1].lower()
+        return chat_type in ("group", "supergroup")
+
+    def _clean_bot_trigger_text(self, text: Optional[str]) -> Optional[str]:
+        if not text:
+            return text
+        cleaned = self._strip_bot_mentions(text)
+        return cleaned or text
+
+    def _should_process_message(self, message: Optional[Message], *, is_command: bool = False) -> bool:
+        """Apply Telegram trigger rules before building/dispatching an event."""
+        if not self._is_group_message(message):
+            return True
+        if str(getattr(getattr(message, "chat", None), "id", "")) in self._telegram_free_response_chats():
+            return True
+        if not self._telegram_require_mention():
+            return True
+
+        if self._is_reply_to_bot(message):
+            return True
+
+        text = (getattr(message, "text", None) or getattr(message, "caption", None) or "").strip()
+
+        command_target = self._extract_command_target(text)
+        if command_target:
+            bot_username = self._resolved_bot_username()
+            return bool(bot_username and command_target.lower() == bot_username)
+
+        if self._message_mentions_bot(message, text):
+            return True
+        if self._message_matches_mention_patterns(message, text):
+            return True
+        if self._has_trigger_prefix(text, self._telegram_trigger_prefixes()):
+            return True
+
+        # Strict mode blocks untargeted group commands like /status.
+        if is_command:
+            return False
+        return False
 
     @staticmethod
     def _has_trigger_prefix(text: str, prefixes: List[str]) -> bool:
@@ -290,6 +433,9 @@ class TelegramAdapter(BasePlatformAdapter):
         if not event or not event.source or source_chat_type != "group":
             return True
 
+        if str(getattr(event.source, "chat_id", "")) in self._telegram_free_response_chats():
+            return True
+
         if not self._telegram_require_mention():
             return True
 
@@ -300,13 +446,17 @@ class TelegramAdapter(BasePlatformAdapter):
         event_text = event.text or ""
         command_target = self._extract_command_target(event_text)
         if command_target:
-            if self._bot_username and command_target.lower() == self._bot_username.lower():
+            bot_username = self._resolved_bot_username()
+            if bot_username and command_target.lower() == bot_username:
                 event.text = self._strip_command_target(event_text).strip()
                 return True
             return False
 
         if self._message_mentions_bot(message, event_text):
             event.text = self._strip_bot_mentions(event_text)
+            return True
+
+        if self._message_matches_mention_patterns(message, event_text):
             return True
 
         if self._has_trigger_prefix(event_text, self._telegram_trigger_prefixes()):
@@ -624,7 +774,19 @@ class TelegramAdapter(BasePlatformAdapter):
                     self._persist_dm_topic_thread_id(int(chat_id), topic_name, thread_id)
 
     async def connect(self) -> bool:
-        """Connect to Telegram and start polling for updates."""
+        """Connect to Telegram via polling or webhook.
+
+        By default, uses long polling (outbound connection to Telegram).
+        If ``TELEGRAM_WEBHOOK_URL`` is set, starts an HTTP webhook server
+        instead.  Webhook mode is useful for cloud deployments (Fly.io,
+        Railway) where inbound HTTP can wake a suspended machine.
+
+        Env vars for webhook mode::
+
+            TELEGRAM_WEBHOOK_URL    Public HTTPS URL (e.g. https://app.fly.dev/telegram)
+            TELEGRAM_WEBHOOK_PORT   Local listen port (default 8443)
+            TELEGRAM_WEBHOOK_SECRET Secret token for update verification
+        """
         if not TELEGRAM_AVAILABLE:
             logger.error(
                 "[%s] python-telegram-bot not installed. Run: pip install python-telegram-bot",
@@ -730,27 +892,57 @@ class TelegramAdapter(BasePlatformAdapter):
                     self.name,
                     e,
                 )
-            loop = asyncio.get_running_loop()
 
-            def _polling_error_callback(error: Exception) -> None:
-                if self._polling_error_task and not self._polling_error_task.done():
-                    return
-                if self._looks_like_polling_conflict(error):
-                    self._polling_error_task = loop.create_task(self._handle_polling_conflict(error))
-                elif self._looks_like_network_error(error):
-                    logger.warning("[%s] Telegram network error, scheduling reconnect: %s", self.name, error)
-                    self._polling_error_task = loop.create_task(self._handle_polling_network_error(error))
-                else:
-                    logger.error("[%s] Telegram polling error: %s", self.name, error, exc_info=True)
+            # Decide between webhook and polling mode
+            webhook_url = os.getenv("TELEGRAM_WEBHOOK_URL", "").strip()
 
-            # Store reference for retry use in _handle_polling_conflict
-            self._polling_error_callback_ref = _polling_error_callback
+            if webhook_url:
+                # ── Webhook mode ─────────────────────────────────────
+                # Telegram pushes updates to our HTTP endpoint.  This
+                # enables cloud platforms (Fly.io, Railway) to auto-wake
+                # suspended machines on inbound HTTP traffic.
+                webhook_port = int(os.getenv("TELEGRAM_WEBHOOK_PORT", "8443"))
+                webhook_secret = os.getenv("TELEGRAM_WEBHOOK_SECRET", "").strip() or None
+                from urllib.parse import urlparse
+                webhook_path = urlparse(webhook_url).path or "/telegram"
 
-            await self._app.updater.start_polling(
-                allowed_updates=Update.ALL_TYPES,
-                drop_pending_updates=True,
-                error_callback=_polling_error_callback,
-            )
+                await self._app.updater.start_webhook(
+                    listen="0.0.0.0",
+                    port=webhook_port,
+                    url_path=webhook_path,
+                    webhook_url=webhook_url,
+                    secret_token=webhook_secret,
+                    allowed_updates=Update.ALL_TYPES,
+                    drop_pending_updates=True,
+                )
+                self._webhook_mode = True
+                logger.info(
+                    "[%s] Webhook server listening on 0.0.0.0:%d%s",
+                    self.name, webhook_port, webhook_path,
+                )
+            else:
+                # ── Polling mode (default) ───────────────────────────
+                loop = asyncio.get_running_loop()
+
+                def _polling_error_callback(error: Exception) -> None:
+                    if self._polling_error_task and not self._polling_error_task.done():
+                        return
+                    if self._looks_like_polling_conflict(error):
+                        self._polling_error_task = loop.create_task(self._handle_polling_conflict(error))
+                    elif self._looks_like_network_error(error):
+                        logger.warning("[%s] Telegram network error, scheduling reconnect: %s", self.name, error)
+                        self._polling_error_task = loop.create_task(self._handle_polling_network_error(error))
+                    else:
+                        logger.error("[%s] Telegram polling error: %s", self.name, error, exc_info=True)
+
+                # Store reference for retry use in _handle_polling_conflict
+                self._polling_error_callback_ref = _polling_error_callback
+
+                await self._app.updater.start_polling(
+                    allowed_updates=Update.ALL_TYPES,
+                    drop_pending_updates=True,
+                    error_callback=_polling_error_callback,
+                )
             
             # Register bot commands so Telegram shows a hint menu when users type /
             # List is derived from the central COMMAND_REGISTRY — adding a new
@@ -770,7 +962,8 @@ class TelegramAdapter(BasePlatformAdapter):
                 )
             
             self._mark_connected()
-            logger.info("[%s] Connected and polling for Telegram updates", self.name)
+            mode = "webhook" if self._webhook_mode else "polling"
+            logger.info("[%s] Connected to Telegram (%s mode)", self.name, mode)
 
             # Set up DM topics (Bot API 9.4 — Private Chat Topics)
             # Runs after connection is established so the bot can call createForumTopic.
@@ -798,7 +991,7 @@ class TelegramAdapter(BasePlatformAdapter):
             return False
     
     async def disconnect(self) -> None:
-        """Stop polling, cancel pending album flushes, and disconnect."""
+        """Stop polling/webhook, cancel pending album flushes, and disconnect."""
         pending_media_group_tasks = list(self._media_group_tasks.values())
         for task in pending_media_group_tasks:
             task.cancel()
@@ -943,6 +1136,16 @@ class TelegramAdapter(BasePlatformAdapter):
                                     self.name, effective_thread_id,
                                 )
                                 effective_thread_id = None
+                                continue
+                            if "message to be replied not found" in err_lower and reply_to_id is not None:
+                                # Original message was deleted before we
+                                # could reply — clear reply target and retry
+                                # so the response is still delivered.
+                                logger.warning(
+                                    "[%s] Reply target deleted, retrying without reply_to: %s",
+                                    self.name, send_err,
+                                )
+                                reply_to_id = None
                                 continue
                             # Other BadRequest errors are permanent — don't retry
                             raise
@@ -1506,13 +1709,18 @@ class TelegramAdapter(BasePlatformAdapter):
         """
         if not update.message or not update.message.text:
             return
+        if not self._should_process_message(update.message):
+            return
 
         event = self._build_message_event(update.message, MessageType.TEXT)
+        event.text = self._clean_bot_trigger_text(event.text)
         self._enqueue_text_event(event)
     
     async def _handle_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming command messages."""
         if not update.message or not update.message.text:
+            return
+        if not self._should_process_message(update.message, is_command=True):
             return
         
         event = self._build_message_event(update.message, MessageType.COMMAND)
@@ -1523,6 +1731,8 @@ class TelegramAdapter(BasePlatformAdapter):
     async def _handle_location_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming location/venue pin messages."""
         if not update.message:
+            return
+        if not self._should_process_message(update.message):
             return
 
         msg = update.message
@@ -1673,6 +1883,8 @@ class TelegramAdapter(BasePlatformAdapter):
         """Handle incoming media messages, downloading images to local cache."""
         if not update.message:
             return
+        if not self._should_process_message(update.message):
+            return
         
         msg = update.message
         
@@ -1696,7 +1908,7 @@ class TelegramAdapter(BasePlatformAdapter):
         
         # Add caption as text
         if msg.caption:
-            event.text = msg.caption
+            event.text = self._clean_bot_trigger_text(msg.caption)
         
         # Handle stickers: describe via vision tool with caching
         if msg.sticker:

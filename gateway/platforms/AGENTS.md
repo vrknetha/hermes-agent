@@ -4,6 +4,7 @@
 - Keep platform-specific mention/reply gating inside the adapter, not in `gateway/run.py`.
 - For Telegram group chats, treat `require_mention=true` as strict mode:
   - accept only when message targets Hermes (mention, reply-to-bot, or trigger prefix)
+  - treat `/command@botusername` as targeted; reject `/command@otherbot`
   - keep DMs unaffected
 - Apply gating at the dispatch point that reflects final message shape:
   - text after batching flush
