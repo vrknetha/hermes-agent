@@ -389,6 +389,12 @@ DEFAULT_CONFIG = {
         "auto_thread": True,           # Auto-create threads on @mention in channels (like Slack)
     },
 
+    # Telegram platform settings (gateway mode)
+    "telegram": {
+        "require_mention": True,   # Require @mention/reply/trigger in groups
+        "trigger_prefixes": [],    # Optional prefixes that bypass mention requirement in groups
+    },
+
     # WhatsApp platform settings (gateway mode)
     "whatsapp": {
         # Reply prefix prepended to every outgoing WhatsApp message.
@@ -429,7 +435,7 @@ DEFAULT_CONFIG = {
     },
 
     # Config schema version - bump this when adding new required fields
-    "_config_version": 10,
+    "_config_version": 11,
 }
 
 # =============================================================================

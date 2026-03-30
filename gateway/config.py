@@ -41,6 +41,26 @@ def _normalize_unauthorized_dm_behavior(value: Any, default: str = "pair") -> st
     return default
 
 
+def _normalize_trigger_prefixes(value: Any) -> List[str]:
+    """Normalize trigger prefixes from config into a deduplicated list."""
+    if value is None:
+        return []
+    if isinstance(value, str):
+        candidates = value.split(",")
+    elif isinstance(value, (list, tuple, set)):
+        candidates = list(value)
+    else:
+        candidates = [value]
+
+    normalized: List[str] = []
+    for item in candidates:
+        prefix = str(item).strip()
+        if not prefix or prefix in normalized:
+            continue
+        normalized.append(prefix)
+    return normalized
+
+
 class Platform(Enum):
     """Supported messaging platforms."""
     LOCAL = "local"
@@ -500,6 +520,7 @@ def load_gateway_config() -> GatewayConfig:
                     continue
                 # Collect bridgeable keys from this platform section
                 bridged = {}
+                bridged_defaults = {}
                 if "unauthorized_dm_behavior" in platform_cfg:
                     bridged["unauthorized_dm_behavior"] = _normalize_unauthorized_dm_behavior(
                         platform_cfg.get("unauthorized_dm_behavior"),
@@ -507,7 +528,17 @@ def load_gateway_config() -> GatewayConfig:
                     )
                 if "reply_prefix" in platform_cfg:
                     bridged["reply_prefix"] = platform_cfg["reply_prefix"]
-                if not bridged:
+                if plat == Platform.TELEGRAM:
+                    if "require_mention" in platform_cfg:
+                        bridged_defaults["require_mention"] = _coerce_bool(
+                            platform_cfg.get("require_mention"),
+                            True,
+                        )
+                    if "trigger_prefixes" in platform_cfg:
+                        bridged_defaults["trigger_prefixes"] = _normalize_trigger_prefixes(
+                            platform_cfg.get("trigger_prefixes")
+                        )
+                if not bridged and not bridged_defaults:
                     continue
                 plat_data = platforms_data.setdefault(plat.value, {})
                 if not isinstance(plat_data, dict):
@@ -518,6 +549,9 @@ def load_gateway_config() -> GatewayConfig:
                     extra = {}
                     plat_data["extra"] = extra
                 extra.update(bridged)
+                for key, value in bridged_defaults.items():
+                    # platforms.<name>.extra should win over top-level <name> keys.
+                    extra.setdefault(key, value)
 
             # Discord settings → env vars (env vars take precedence)
             discord_cfg = yaml_cfg.get("discord", {})
@@ -825,5 +859,4 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
             config.default_reset_policy.at_hour = int(reset_hour)
         except ValueError:
             pass
-
 

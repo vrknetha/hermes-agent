@@ -140,6 +140,8 @@ class TelegramAdapter(BasePlatformAdapter):
         self._polling_conflict_count: int = 0
         self._polling_network_error_count: int = 0
         self._polling_error_callback_ref = None
+        self._bot_user_id: Optional[str] = None
+        self._bot_username: Optional[str] = None
         # DM Topics: map of topic_name -> message_thread_id (populated at startup)
         self._dm_topics: Dict[str, int] = {}
         # DM Topics config from extra.dm_topics
@@ -151,6 +153,139 @@ class TelegramAdapter(BasePlatformAdapter):
         if isinstance(configured, str):
             configured = configured.split(",")
         return parse_fallback_ip_env(",".join(str(v) for v in configured) if configured else None)
+
+    def _telegram_require_mention(self) -> bool:
+        """Return whether group messages require mention/reply/prefix targeting."""
+        value = self.config.extra.get("require_mention", True) if getattr(self.config, "extra", None) else True
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            return value.strip().lower() not in ("false", "0", "no", "off")
+        return bool(value)
+
+    def _telegram_trigger_prefixes(self) -> List[str]:
+        """Return normalized trigger prefixes for Telegram group gating."""
+        raw = self.config.extra.get("trigger_prefixes", []) if getattr(self.config, "extra", None) else []
+        if isinstance(raw, str):
+            candidates = raw.split(",")
+        elif isinstance(raw, (list, tuple, set)):
+            candidates = list(raw)
+        else:
+            candidates = [raw]
+
+        prefixes: List[str] = []
+        for item in candidates:
+            prefix = str(item).strip()
+            if not prefix or prefix in prefixes:
+                continue
+            prefixes.append(prefix)
+        return prefixes
+
+    def _text_mentions_bot(self, text: str) -> bool:
+        """Return True when text contains @<bot_username> mention."""
+        if not text or not self._bot_username:
+            return False
+        pattern = rf"(?<!\w)@{re.escape(self._bot_username)}\b"
+        return re.search(pattern, text, flags=re.IGNORECASE) is not None
+
+    def _strip_bot_mentions(self, text: str) -> str:
+        """Strip @<bot_username> mention tokens from text."""
+        if not text or not self._bot_username:
+            return text
+        pattern = rf"(?<!\w)@{re.escape(self._bot_username)}\b"
+        stripped = re.sub(pattern, "", text, flags=re.IGNORECASE)
+        stripped = re.sub(r"[ \t]{2,}", " ", stripped)
+        stripped = re.sub(r"[ \t]*\n[ \t]*", "\n", stripped)
+        return stripped.strip()
+
+    def _message_mentions_bot(self, message: Optional[Message], fallback_text: str = "") -> bool:
+        """Return True when the Telegram message mentions this bot."""
+        if message is None:
+            return self._text_mentions_bot(fallback_text)
+
+        candidates: List[str] = []
+        text = getattr(message, "text", None)
+        caption = getattr(message, "caption", None)
+        if isinstance(text, str) and text:
+            candidates.append(text)
+        if isinstance(caption, str) and caption:
+            candidates.append(caption)
+        if fallback_text:
+            candidates.append(fallback_text)
+
+        # Entity-based detection catches @mentions and text_mention entities.
+        entity_sources = (
+            (getattr(message, "text", None), getattr(message, "entities", None)),
+            (getattr(message, "caption", None), getattr(message, "caption_entities", None)),
+        )
+        for source_text, entities in entity_sources:
+            if not source_text or not entities:
+                continue
+            for entity in entities:
+                raw_entity_type = getattr(entity, "type", "")
+                entity_type_value = getattr(raw_entity_type, "value", raw_entity_type)
+                entity_type = str(entity_type_value).lower()
+                if (entity_type == "mention" or entity_type.endswith(".mention")) and self._bot_username:
+                    offset = int(getattr(entity, "offset", 0))
+                    length = int(getattr(entity, "length", 0))
+                    mention = source_text[offset:offset + length]
+                    if mention.lower() == f"@{self._bot_username.lower()}":
+                        return True
+                if (entity_type == "text_mention" or entity_type.endswith(".text_mention")) and self._bot_user_id:
+                    user = getattr(entity, "user", None)
+                    user_id = getattr(user, "id", None) if user else None
+                    if user_id is not None and str(user_id) == str(self._bot_user_id):
+                        return True
+
+        return any(self._text_mentions_bot(candidate) for candidate in candidates)
+
+    def _is_reply_to_bot(self, message: Optional[Message]) -> bool:
+        """Return True when the incoming message replies to a bot-authored message."""
+        if message is None or not self._bot_user_id:
+            return False
+        reply_to = getattr(message, "reply_to_message", None)
+        if not reply_to:
+            return False
+        reply_user = getattr(reply_to, "from_user", None)
+        reply_user_id = getattr(reply_user, "id", None) if reply_user else None
+        return reply_user_id is not None and str(reply_user_id) == str(self._bot_user_id)
+
+    @staticmethod
+    def _has_trigger_prefix(text: str, prefixes: List[str]) -> bool:
+        """Return True when text starts with any configured trigger prefix."""
+        if not text or not prefixes:
+            return False
+        candidate = text.lstrip()
+        return any(candidate.startswith(prefix) for prefix in prefixes if prefix)
+
+    def _should_process_group_event(self, event: MessageEvent) -> bool:
+        """Apply mention/reply/prefix gating for Telegram group messages."""
+        source_chat_type = getattr(event.source, "chat_type", None) if event and event.source else None
+        if not event or not event.source or source_chat_type != "group":
+            return True
+
+        if not self._telegram_require_mention():
+            return True
+
+        message = event.raw_message
+        if self._is_reply_to_bot(message):
+            return True
+
+        event_text = event.text or ""
+        if self._message_mentions_bot(message, event_text):
+            event.text = self._strip_bot_mentions(event_text)
+            return True
+
+        if self._has_trigger_prefix(event_text, self._telegram_trigger_prefixes()):
+            return True
+
+        logger.debug(
+            "[%s] Telegram: skipping non-targeted group message (chat_id=%s, message_id=%s)",
+            self.name,
+            event.source.chat_id,
+            event.message_id,
+        )
+        return False
 
     @staticmethod
     def _looks_like_polling_conflict(error: Exception) -> bool:
@@ -550,6 +685,18 @@ class TelegramAdapter(BasePlatformAdapter):
                     else:
                         raise
             await self._app.start()
+            try:
+                me = await self._bot.get_me()
+                bot_id = getattr(me, "id", None)
+                bot_username = getattr(me, "username", None)
+                self._bot_user_id = str(bot_id) if bot_id is not None else None
+                self._bot_username = bot_username.lower() if isinstance(bot_username, str) and bot_username else None
+            except Exception as e:
+                logger.warning(
+                    "[%s] Failed to fetch Telegram bot identity for mention gating: %s",
+                    self.name,
+                    e,
+                )
             loop = asyncio.get_running_loop()
 
             def _polling_error_callback(error: Exception) -> None:
@@ -653,6 +800,8 @@ class TelegramAdapter(BasePlatformAdapter):
         self._mark_disconnected()
         self._app = None
         self._bot = None
+        self._bot_user_id = None
+        self._bot_username = None
         self._token_lock_identity = None
         logger.info("[%s] Disconnected from Telegram", self.name)
 
@@ -1334,6 +1483,8 @@ class TelegramAdapter(BasePlatformAdapter):
             return
         
         event = self._build_message_event(update.message, MessageType.COMMAND)
+        if not self._should_process_group_event(event):
+            return
         await self.handle_message(event)
     
     async def _handle_location_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1369,6 +1520,8 @@ class TelegramAdapter(BasePlatformAdapter):
 
         event = self._build_message_event(msg, MessageType.LOCATION)
         event.text = "\n".join(parts)
+        if not self._should_process_group_event(event):
+            return
         await self.handle_message(event)
 
     # ------------------------------------------------------------------
@@ -1424,6 +1577,8 @@ class TelegramAdapter(BasePlatformAdapter):
                 "[Telegram] Flushing text batch %s (%d chars)",
                 key, len(event.text or ""),
             )
+            if not self._should_process_group_event(event):
+                return
             await self.handle_message(event)
         finally:
             if self._pending_text_batch_tasks.get(key) is current_task:
@@ -1454,6 +1609,8 @@ class TelegramAdapter(BasePlatformAdapter):
             if not event:
                 return
             logger.info("[Telegram] Flushing photo batch %s with %d image(s)", batch_key, len(event.media_urls))
+            if not self._should_process_group_event(event):
+                return
             await self.handle_message(event)
         finally:
             if self._pending_photo_batch_tasks.get(batch_key) is current_task:
@@ -1511,6 +1668,8 @@ class TelegramAdapter(BasePlatformAdapter):
         # Handle stickers: describe via vision tool with caching
         if msg.sticker:
             await self._handle_sticker(msg, event)
+            if not self._should_process_group_event(event):
+                return
             await self.handle_message(event)
             return
         
@@ -1592,6 +1751,8 @@ class TelegramAdapter(BasePlatformAdapter):
                         f"Supported types: {supported_list}"
                     )
                     logger.info("[Telegram] Unsupported document type: %s", ext or "unknown")
+                    if not self._should_process_group_event(event):
+                        return
                     await self.handle_message(event)
                     return
 
@@ -1603,6 +1764,8 @@ class TelegramAdapter(BasePlatformAdapter):
                         "Maximum: 20 MB."
                     )
                     logger.info("[Telegram] Document too large: %s bytes", doc.file_size)
+                    if not self._should_process_group_event(event):
+                        return
                     await self.handle_message(event)
                     return
 
@@ -1642,6 +1805,8 @@ class TelegramAdapter(BasePlatformAdapter):
             await self._queue_media_group_event(str(media_group_id), event)
             return
 
+        if not self._should_process_group_event(event):
+            return
         await self.handle_message(event)
     
     async def _queue_media_group_event(self, media_group_id: str, event: MessageEvent) -> None:
@@ -1678,6 +1843,8 @@ class TelegramAdapter(BasePlatformAdapter):
             await asyncio.sleep(self.MEDIA_GROUP_WAIT_SECONDS)
             event = self._media_group_events.pop(media_group_id, None)
             if event is not None:
+                if not self._should_process_group_event(event):
+                    return
                 await self.handle_message(event)
         except asyncio.CancelledError:
             return

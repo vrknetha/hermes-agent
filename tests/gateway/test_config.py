@@ -192,3 +192,51 @@ class TestLoadGatewayConfig:
 
         assert config.unauthorized_dm_behavior == "ignore"
         assert config.platforms[Platform.WHATSAPP].extra["unauthorized_dm_behavior"] == "pair"
+
+    def test_bridges_telegram_require_mention_and_trigger_prefixes(self, tmp_path, monkeypatch):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        config_path = hermes_home / "config.yaml"
+        config_path.write_text(
+            "telegram:\n"
+            "  require_mention: true\n"
+            "  trigger_prefixes:\n"
+            "    - /\n"
+            "    - \"!\"\n",
+            encoding="utf-8",
+        )
+
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        config = load_gateway_config()
+
+        assert Platform.TELEGRAM in config.platforms
+        extra = config.platforms[Platform.TELEGRAM].extra
+        assert extra["require_mention"] is True
+        assert extra["trigger_prefixes"] == ["/", "!"]
+
+    def test_platforms_extra_overrides_top_level_telegram_bridge(self, tmp_path, monkeypatch):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        config_path = hermes_home / "config.yaml"
+        config_path.write_text(
+            "telegram:\n"
+            "  require_mention: true\n"
+            "  trigger_prefixes: /,! \n"
+            "platforms:\n"
+            "  telegram:\n"
+            "    extra:\n"
+            "      require_mention: false\n"
+            "      trigger_prefixes:\n"
+            "        - .\n",
+            encoding="utf-8",
+        )
+
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        config = load_gateway_config()
+
+        assert Platform.TELEGRAM in config.platforms
+        extra = config.platforms[Platform.TELEGRAM].extra
+        assert extra["require_mention"] is False
+        assert extra["trigger_prefixes"] == ["."]
