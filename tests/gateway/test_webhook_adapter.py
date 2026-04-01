@@ -651,13 +651,16 @@ class TestDeliveryCleanup:
         """send() pops delivery_info so the entry doesn't leak memory."""
         adapter = _make_adapter()
         chat_id = "webhook:test:d-xyz"
-        adapter._delivery_info[chat_id] = {
-            "deliver": "log",
-            "deliver_extra": {},
-            "payload": {"x": 1},
-        }
+        adapter._delivery_info[chat_id] = [
+            {
+                "delivery_id": "d-xyz",
+                "deliver": "log",
+                "deliver_extra": {},
+                "payload": {"x": 1},
+            }
+        ]
 
-        result = await adapter.send(chat_id, "Agent response here")
+        result = await adapter.send(chat_id, "Agent response here", reply_to="d-xyz")
         assert result.success is True
         assert chat_id not in adapter._delivery_info
 
@@ -675,15 +678,18 @@ class TestRelayHttpDeliveryFailures:
         }
         adapter = _make_adapter(routes=routes)
         chat_id = "webhook:relay:d-1"
-        adapter._delivery_info[chat_id] = {
-            "deliver": "relay_http",
-            "deliver_extra": {},
-            "payload": {"sender_did": "did:example:alice"},
-        }
+        adapter._delivery_info[chat_id] = [
+            {
+                "delivery_id": "d-1",
+                "deliver": "relay_http",
+                "deliver_extra": {},
+                "payload": {"sender_did": "did:example:alice"},
+            }
+        ]
 
         # Ensure top-level config fallback is empty in this test process.
         with patch("tools.relay_outbound._load_config_connector_base_url", return_value=""):
-            result = await adapter.send(chat_id, "hello")
+            result = await adapter.send(chat_id, "hello", reply_to="d-1")
 
         assert result.success is False
         assert "Missing relay connector URL" in (result.error or "")
@@ -692,21 +698,87 @@ class TestRelayHttpDeliveryFailures:
     async def test_missing_route_metadata_fails_before_http_call(self):
         adapter = _make_adapter()
         chat_id = "webhook:relay:d-2"
-        adapter._delivery_info[chat_id] = {
-            "deliver": "relay_http",
-            "deliver_extra": {},
-            "payload": {},
-        }
+        adapter._delivery_info[chat_id] = [
+            {
+                "delivery_id": "d-2",
+                "deliver": "relay_http",
+                "deliver_extra": {},
+                "payload": {},
+            }
+        ]
 
         with patch(
             "gateway.platforms.webhook.post_relay_outbound",
             new=AsyncMock(return_value={"success": True}),
         ) as relay_mock:
-            result = await adapter.send(chat_id, "hello")
+            result = await adapter.send(chat_id, "hello", reply_to="d-2")
 
         assert result.success is False
         assert "metadata.groupId and sender_did" in (result.error or "")
         relay_mock.assert_not_awaited()
+
+
+class TestStickySessionDeliveryQueue:
+    @pytest.mark.asyncio
+    async def test_sticky_session_preserves_per_delivery_metadata(self):
+        routes = {
+            "relay": {
+                "secret": _INSECURE_NO_AUTH,
+                "prompt": "reply",
+                "deliver": "relay_http",
+            }
+        }
+        adapter = _make_adapter(routes=routes)
+        adapter.handle_message = AsyncMock()
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            headers_a = {
+                "X-GitHub-Delivery": "d-a",
+                "X-Webhook-Session-Key": "shared",
+            }
+            resp_a = await cli.post(
+                "/webhooks/relay",
+                json={"sender_did": "did:example:a"},
+                headers=headers_a,
+            )
+            assert resp_a.status == 202
+
+            headers_b = {
+                "X-GitHub-Delivery": "d-b",
+                "X-Webhook-Session-Key": "shared",
+            }
+            resp_b = await cli.post(
+                "/webhooks/relay",
+                json={"sender_did": "did:example:b"},
+                headers=headers_b,
+            )
+            assert resp_b.status == 202
+
+        chat_id = "webhook:relay:shared"
+        queue = adapter._delivery_info.get(chat_id, [])
+        assert len(queue) == 2
+
+        relay_mock = AsyncMock(
+            side_effect=[
+                {"success": True, "route_type": "direct", "target": "did:example:a"},
+                {"success": True, "route_type": "direct", "target": "did:example:b"},
+            ]
+        )
+
+        async def _send_once(reply_to: str, text: str):
+            return await adapter.send(chat_id, text, reply_to=reply_to)
+
+        with patch("gateway.platforms.webhook.post_relay_outbound", new=relay_mock):
+            result_a = await asyncio.create_task(_send_once("d-a", "resp-a"))
+            result_b = await asyncio.create_task(_send_once("d-b", "resp-b"))
+
+        assert result_a.success is True
+        assert result_b.success is True
+        assert relay_mock.await_count == 2
+        assert relay_mock.await_args_list[0].kwargs["to_agent_did"] == "did:example:a"
+        assert relay_mock.await_args_list[1].kwargs["to_agent_did"] == "did:example:b"
+        assert chat_id not in adapter._delivery_info
 
 
 # ===================================================================

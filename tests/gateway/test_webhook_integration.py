@@ -305,7 +305,7 @@ class TestGitHubCommentDelivery:
         assert chat_id in adapter._delivery_info
 
         # Verify deliver_extra was rendered with payload data
-        delivery = adapter._delivery_info[chat_id]
+        delivery = adapter._delivery_info[chat_id][0]
         assert delivery["deliver_extra"]["repo"] == "org/repo"
         assert delivery["deliver_extra"]["pr_number"] == "42"
 

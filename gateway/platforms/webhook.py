@@ -78,8 +78,13 @@ class WebhookAdapter(BasePlatformAdapter):
         self._routes: Dict[str, dict] = dict(self._static_routes)
         self._runner = None
 
-        # Delivery info keyed by session chat_id — consumed by send()
-        self._delivery_info: Dict[str, dict] = {}
+        # Delivery info keyed by session chat_id.
+        # Each chat_id keeps a queue of deliveries to avoid metadata overwrite
+        # when sticky sessions receive multiple in-flight deliveries.
+        self._delivery_info: Dict[str, List[dict]] = {}
+        # Per-task bound delivery context so multi-part sends in one processing
+        # task use a consistent routing target.
+        self._task_delivery: Dict[asyncio.Task, dict] = {}
 
         # Reference to gateway runner for cross-platform delivery (set externally)
         self.gateway_runner = None
@@ -150,6 +155,8 @@ class WebhookAdapter(BasePlatformAdapter):
         if self._runner:
             await self._runner.cleanup()
             self._runner = None
+        self._delivery_info.clear()
+        self._task_delivery.clear()
         self._mark_disconnected()
         logger.info("[webhook] Disconnected")
 
@@ -162,10 +169,10 @@ class WebhookAdapter(BasePlatformAdapter):
     ) -> SendResult:
         """Deliver the agent's response to the configured destination.
 
-        chat_id is ``webhook:{route}:{delivery_id}`` — we pop the delivery
-        info stored during webhook receipt so it doesn't leak memory.
+        chat_id is ``webhook:{route}:{delivery_id}`` (or sticky session key)
+        and delivery metadata is resolved per task/delivery ID.
         """
-        delivery = self._delivery_info.pop(chat_id, {})
+        delivery = self._resolve_delivery(chat_id=chat_id, delivery_id=reply_to)
         deliver_type = delivery.get("deliver", "log")
 
         if deliver_type == "log":
@@ -400,13 +407,14 @@ class WebhookAdapter(BasePlatformAdapter):
 
         # Store delivery info for send() — consumed (popped) on delivery
         deliver_config = {
+            "delivery_id": delivery_id,
             "deliver": route_config.get("deliver", "log"),
             "deliver_extra": self._render_delivery_extra(
                 route_config.get("deliver_extra", {}), payload
             ),
             "payload": payload,
         }
-        self._delivery_info[session_chat_id] = deliver_config
+        self._delivery_info.setdefault(session_chat_id, []).append(deliver_config)
 
         # Build source and event
         source = self.build_source(
@@ -455,6 +463,70 @@ class WebhookAdapter(BasePlatformAdapter):
             return ""
         normalized = re.sub(r"[^a-zA-Z0-9:._-]", "_", value)
         return normalized[:160]
+
+    def _resolve_delivery(self, chat_id: str, delivery_id: Optional[str]) -> dict:
+        """Resolve and bind delivery metadata for the current async task."""
+        task = asyncio.current_task()
+        wanted_id = str(delivery_id or "").strip()
+
+        if task is not None:
+            bound = self._task_delivery.get(task)
+            if bound:
+                bound_id = str(bound.get("delivery_id", "")).strip()
+                if wanted_id and bound_id and wanted_id != bound_id:
+                    # Same task, new delivery (can happen in recursive pending-message flow).
+                    self._task_delivery.pop(task, None)
+                else:
+                    return bound
+
+        queue = self._delivery_info.get(chat_id, [])
+        if not queue:
+            return {}
+
+        selected_idx = 0
+        if wanted_id:
+            for idx, item in enumerate(queue):
+                if str(item.get("delivery_id", "")).strip() == wanted_id:
+                    selected_idx = idx
+                    break
+
+        delivery = queue.pop(selected_idx)
+        if queue:
+            self._delivery_info[chat_id] = queue
+        else:
+            self._delivery_info.pop(chat_id, None)
+
+        if task is not None:
+            self._task_delivery[task] = delivery
+            task.add_done_callback(lambda done: self._task_delivery.pop(done, None))
+
+        return delivery
+
+    async def on_processing_complete(self, event: MessageEvent, success: bool) -> None:
+        """Cleanup stale delivery metadata for completed events."""
+        chat_id = str(getattr(event.source, "chat_id", "") or "")
+        delivery_id = str(getattr(event, "message_id", "") or "").strip()
+
+        if chat_id and delivery_id:
+            queue = self._delivery_info.get(chat_id, [])
+            if queue:
+                filtered = [
+                    item
+                    for item in queue
+                    if str(item.get("delivery_id", "")).strip() != delivery_id
+                ]
+                if filtered:
+                    self._delivery_info[chat_id] = filtered
+                else:
+                    self._delivery_info.pop(chat_id, None)
+
+        task = asyncio.current_task()
+        if task is not None:
+            bound = self._task_delivery.get(task)
+            if bound is not None:
+                bound_id = str(bound.get("delivery_id", "")).strip()
+                if not delivery_id or bound_id == delivery_id:
+                    self._task_delivery.pop(task, None)
 
     # ------------------------------------------------------------------
     # Signature validation
