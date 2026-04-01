@@ -8,7 +8,7 @@ description: "Receive events from GitHub, GitLab, and other services to trigger 
 
 Receive events from external services (GitHub, GitLab, JIRA, Stripe, etc.) and trigger Hermes agent runs automatically. The webhook adapter runs an HTTP server that accepts POST requests, validates HMAC signatures, transforms payloads into agent prompts, and routes responses back to the source or to another configured platform.
 
-The agent processes the event and can respond by posting comments on PRs, sending messages to Telegram/Discord, or logging the result.
+The agent processes the event and can respond by posting comments on PRs, sending messages to Telegram/Discord, sending through a generic outbound relay, or logging the result.
 
 ---
 
@@ -70,7 +70,7 @@ Routes define how different webhook sources are handled. Each route is a named e
 | `secret` | **Yes** | HMAC secret for signature validation. Falls back to the global `secret` if not set on the route. Set to `"INSECURE_NO_AUTH"` for testing only (skips validation). |
 | `prompt` | No | Template string with dot-notation payload access (e.g. `{pull_request.title}`). If omitted, the full JSON payload is dumped into the prompt. |
 | `skills` | No | List of skill names to load for the agent run. |
-| `deliver` | No | Where to send the response: `github_comment`, `telegram`, `discord`, `slack`, `signal`, `sms`, or `log` (default). |
+| `deliver` | No | Where to send the response: `github_comment`, `telegram`, `discord`, `slack`, `signal`, `sms`, `relay_http`, or `log` (default). |
 | `deliver_extra` | No | Additional delivery config — keys depend on `deliver` type (e.g. `repo`, `pr_number`, `chat_id`). Values support the same `{dot.notation}` templates as `prompt`. |
 
 ### Full example
@@ -200,8 +200,51 @@ The `deliver` field controls where the agent's response goes after processing th
 | `slack` | Routes the response to Slack. Uses the home channel, or specify `chat_id` in `deliver_extra`. |
 | `signal` | Routes the response to Signal. Uses the home channel, or specify `chat_id` in `deliver_extra`. |
 | `sms` | Routes the response to SMS via Twilio. Uses the home channel, or specify `chat_id` in `deliver_extra`. |
+| `relay_http` | Sends the response to a local connector runtime using `POST /v1/outbound`. Routing is selected from inbound payload metadata (`metadata.groupId` or `sender_did`). |
 
 For cross-platform delivery (telegram, discord, slack, signal, sms), the target platform must also be enabled and connected in the gateway. If no `chat_id` is provided in `deliver_extra`, the response is sent to that platform's configured home channel.
+
+For `relay_http`, Hermes resolves the connector URL in this order:
+
+1. `deliver_extra.connector_base_url` (route-level override)
+2. `RELAY_CONNECTOR_BASE_URL`
+3. top-level config `relay.connector_base_url`
+
+### `relay_http` route example
+
+```yaml
+relay:
+  connector_base_url: "http://127.0.0.1:9001"
+
+platforms:
+  webhook:
+    enabled: true
+    extra:
+      routes:
+        inbound-generic:
+          secret: "INSECURE_NO_AUTH"
+          prompt: "Handle event: {event_type}"
+          deliver: "relay_http"
+```
+
+### Inbound fields required for `relay_http`
+
+- Group reply:
+  - Requires `metadata.groupId` in the inbound payload
+  - Hermes sends outbound with `groupId`
+- Direct reply:
+  - Used when `metadata.groupId` is absent
+  - Requires `sender_did` in the inbound payload
+  - Hermes sends outbound with `toAgentDid = sender_did`
+- Conversation continuity:
+  - If `metadata.conversationId` exists, Hermes forwards it unchanged as `conversationId`
+
+### `relay_http` failure behavior
+
+- Hermes fails and does not send when the connector URL is missing.
+- Hermes fails and does not send when both route targets are missing (`metadata.groupId` and `sender_did`).
+- Hermes fails and does not send direct replies when `sender_did` is missing and no group target is present.
+- Hermes skips sending when final assistant text is empty after trimming.
 
 ---
 
@@ -358,3 +401,4 @@ Webhook payloads contain attacker-controlled data — PR titles, commit messages
 | `WEBHOOK_ENABLED` | Enable the webhook platform adapter | `false` |
 | `WEBHOOK_PORT` | HTTP server port for receiving webhooks | `8644` |
 | `WEBHOOK_SECRET` | Global HMAC secret (used as fallback when routes don't specify their own) | _(none)_ |
+| `RELAY_CONNECTOR_BASE_URL` | Base URL for outbound relay connector (`POST /v1/outbound`) | _(none)_ |

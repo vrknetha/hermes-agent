@@ -67,6 +67,7 @@ _modules = [
     "tools.delegate_tool",
     "tools.process_registry",
     "tools.send_message_tool",
+    "tools.relay_send_tool",
     "tools.honcho_tools",
     "tools.homeassistant_tool",
 ]
@@ -104,6 +105,16 @@ Key behaviors:
 - Check results are **cached per-call** — if multiple tools share the same `check_fn`, it only runs once.
 - Exceptions in `check_fn()` are treated as "unavailable" (fail-safe).
 - The `is_toolset_available()` method checks whether a toolset's `check_fn` passes, used for UI display and toolset resolution.
+
+## Relay outbound transport
+
+- Shared transport logic for generic outbound relay lives in `tools/relay_outbound.py`.
+- Both webhook `deliver: relay_http` and the `relay_send` tool must reuse this helper.
+- The helper enforces:
+  - `POST /v1/outbound`
+  - exact target XOR (`toAgentDid` for direct, `groupId` for group)
+  - no send when message text is empty after trim
+  - connector URL resolution order: explicit arg → `RELAY_CONNECTOR_BASE_URL` → `relay.connector_base_url`
 
 ## Toolset resolution
 

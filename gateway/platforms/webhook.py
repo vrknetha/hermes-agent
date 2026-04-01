@@ -48,6 +48,7 @@ from gateway.platforms.base import (
     MessageType,
     SendResult,
 )
+from tools.relay_outbound import post_relay_outbound
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +56,7 @@ DEFAULT_HOST = "0.0.0.0"
 DEFAULT_PORT = 8644
 _INSECURE_NO_AUTH = "INSECURE_NO_AUTH"
 _DYNAMIC_ROUTES_FILENAME = "webhook_subscriptions.json"
+_SESSION_KEY_HEADER = "X-Webhook-Session-Key"
 
 
 def check_webhook_requirements() -> bool:
@@ -76,8 +78,13 @@ class WebhookAdapter(BasePlatformAdapter):
         self._routes: Dict[str, dict] = dict(self._static_routes)
         self._runner = None
 
-        # Delivery info keyed by session chat_id — consumed by send()
-        self._delivery_info: Dict[str, dict] = {}
+        # Delivery info keyed by session chat_id.
+        # Each chat_id keeps a queue of deliveries to avoid metadata overwrite
+        # when sticky sessions receive multiple in-flight deliveries.
+        self._delivery_info: Dict[str, List[dict]] = {}
+        # Per-task bound delivery context so multi-part sends in one processing
+        # task use a consistent routing target.
+        self._task_delivery: Dict[asyncio.Task, dict] = {}
 
         # Reference to gateway runner for cross-platform delivery (set externally)
         self.gateway_runner = None
@@ -148,6 +155,8 @@ class WebhookAdapter(BasePlatformAdapter):
         if self._runner:
             await self._runner.cleanup()
             self._runner = None
+        self._delivery_info.clear()
+        self._task_delivery.clear()
         self._mark_disconnected()
         logger.info("[webhook] Disconnected")
 
@@ -160,10 +169,10 @@ class WebhookAdapter(BasePlatformAdapter):
     ) -> SendResult:
         """Deliver the agent's response to the configured destination.
 
-        chat_id is ``webhook:{route}:{delivery_id}`` — we pop the delivery
-        info stored during webhook receipt so it doesn't leak memory.
+        chat_id is ``webhook:{route}:{delivery_id}`` (or sticky session key)
+        and delivery metadata is resolved per task/delivery ID.
         """
-        delivery = self._delivery_info.pop(chat_id, {})
+        delivery = self._resolve_delivery(chat_id=chat_id, delivery_id=reply_to)
         deliver_type = delivery.get("deliver", "log")
 
         if deliver_type == "log":
@@ -172,6 +181,9 @@ class WebhookAdapter(BasePlatformAdapter):
 
         if deliver_type == "github_comment":
             return await self._deliver_github_comment(content, delivery)
+
+        if deliver_type == "relay_http":
+            return await self._deliver_relay_http(content, delivery)
 
         # Cross-platform delivery (telegram, discord, etc.)
         if self.gateway_runner and deliver_type in (
@@ -380,19 +392,29 @@ class WebhookAdapter(BasePlatformAdapter):
             )
         self._seen_deliveries[delivery_id] = now
 
-        # Use delivery_id in session key so concurrent webhooks on the
-        # same route get independent agent runs (not queued/interrupted).
-        session_chat_id = f"webhook:{route_name}:{delivery_id}"
+        # Optional session-key header keeps thread continuity for callers
+        # that want sticky sessions while preserving default per-delivery
+        # isolation for existing integrations.
+        session_key = self._normalize_session_key(
+            request.headers.get(_SESSION_KEY_HEADER, "")
+        )
+        if session_key:
+            session_chat_id = f"webhook:{route_name}:{session_key}"
+        else:
+            # Use delivery_id in session key so concurrent webhooks on the
+            # same route get independent agent runs (not queued/interrupted).
+            session_chat_id = f"webhook:{route_name}:{delivery_id}"
 
         # Store delivery info for send() — consumed (popped) on delivery
         deliver_config = {
+            "delivery_id": delivery_id,
             "deliver": route_config.get("deliver", "log"),
             "deliver_extra": self._render_delivery_extra(
                 route_config.get("deliver_extra", {}), payload
             ),
             "payload": payload,
         }
-        self._delivery_info[session_chat_id] = deliver_config
+        self._delivery_info.setdefault(session_chat_id, []).append(deliver_config)
 
         # Build source and event
         source = self.build_source(
@@ -433,6 +455,78 @@ class WebhookAdapter(BasePlatformAdapter):
             },
             status=202,
         )
+
+    @staticmethod
+    def _normalize_session_key(raw_value: str) -> str:
+        value = (raw_value or "").strip()
+        if not value:
+            return ""
+        normalized = re.sub(r"[^a-zA-Z0-9:._-]", "_", value)
+        return normalized[:160]
+
+    def _resolve_delivery(self, chat_id: str, delivery_id: Optional[str]) -> dict:
+        """Resolve and bind delivery metadata for the current async task."""
+        task = asyncio.current_task()
+        wanted_id = str(delivery_id or "").strip()
+
+        if task is not None:
+            bound = self._task_delivery.get(task)
+            if bound:
+                bound_id = str(bound.get("delivery_id", "")).strip()
+                if wanted_id and bound_id and wanted_id != bound_id:
+                    # Same task, new delivery (can happen in recursive pending-message flow).
+                    self._task_delivery.pop(task, None)
+                else:
+                    return bound
+
+        queue = self._delivery_info.get(chat_id, [])
+        if not queue:
+            return {}
+
+        selected_idx = 0
+        if wanted_id:
+            for idx, item in enumerate(queue):
+                if str(item.get("delivery_id", "")).strip() == wanted_id:
+                    selected_idx = idx
+                    break
+
+        delivery = queue.pop(selected_idx)
+        if queue:
+            self._delivery_info[chat_id] = queue
+        else:
+            self._delivery_info.pop(chat_id, None)
+
+        if task is not None:
+            self._task_delivery[task] = delivery
+            task.add_done_callback(lambda done: self._task_delivery.pop(done, None))
+
+        return delivery
+
+    async def on_processing_complete(self, event: MessageEvent, success: bool) -> None:
+        """Cleanup stale delivery metadata for completed events."""
+        chat_id = str(getattr(event.source, "chat_id", "") or "")
+        delivery_id = str(getattr(event, "message_id", "") or "").strip()
+
+        if chat_id and delivery_id:
+            queue = self._delivery_info.get(chat_id, [])
+            if queue:
+                filtered = [
+                    item
+                    for item in queue
+                    if str(item.get("delivery_id", "")).strip() != delivery_id
+                ]
+                if filtered:
+                    self._delivery_info[chat_id] = filtered
+                else:
+                    self._delivery_info.pop(chat_id, None)
+
+        task = asyncio.current_task()
+        if task is not None:
+            bound = self._task_delivery.get(task)
+            if bound is not None:
+                bound_id = str(bound.get("delivery_id", "")).strip()
+                if not delivery_id or bound_id == delivery_id:
+                    self._task_delivery.pop(task, None)
 
     # ------------------------------------------------------------------
     # Signature validation
@@ -614,3 +708,59 @@ class WebhookAdapter(BasePlatformAdapter):
                 )
 
         return await adapter.send(chat_id, content)
+
+    async def _deliver_relay_http(
+        self, content: str, delivery: dict
+    ) -> SendResult:
+        """Deliver response via generic outbound relay HTTP endpoint."""
+        payload = delivery.get("payload", {}) if isinstance(delivery, dict) else {}
+        if not isinstance(payload, dict):
+            payload = {}
+
+        metadata = payload.get("metadata", {})
+        if not isinstance(metadata, dict):
+            metadata = {}
+
+        group_id = str(metadata.get("groupId", "")).strip()
+        conversation_id = str(metadata.get("conversationId", "")).strip() or None
+        sender_did = str(payload.get("sender_did", "")).strip()
+
+        if not group_id and not sender_did:
+            return SendResult(
+                success=False,
+                error=(
+                    "Cannot route relay_http reply: inbound payload is missing "
+                    "metadata.groupId and sender_did (direct replies require "
+                    "sender_did)."
+                ),
+            )
+
+        extra = delivery.get("deliver_extra", {}) if isinstance(delivery, dict) else {}
+        connector_base_url = None
+        if isinstance(extra, dict):
+            raw_url = str(extra.get("connector_base_url", "")).strip()
+            connector_base_url = raw_url or None
+
+        if group_id:
+            relay_result = await post_relay_outbound(
+                message=content,
+                group_id=group_id,
+                conversation_id=conversation_id,
+                connector_base_url=connector_base_url,
+            )
+        else:
+            relay_result = await post_relay_outbound(
+                message=content,
+                to_agent_did=sender_did,
+                conversation_id=conversation_id,
+                connector_base_url=connector_base_url,
+            )
+
+        if relay_result.get("success"):
+            return SendResult(success=True, raw_response=relay_result)
+
+        return SendResult(
+            success=False,
+            error=relay_result.get("error", "relay_http delivery failed"),
+            raw_response=relay_result,
+        )
