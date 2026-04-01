@@ -91,6 +91,7 @@ This page documents the built-in Hermes tool registry as it exists in code. Avai
 
 | Tool | Description | Requires environment |
 |------|-------------|----------------------|
+| `relay_send` | Send a message through the generic outbound relay endpoint (`POST /v1/outbound`) using direct (`to_agent_did`) or group (`group_id`) routing. Validates exact route XOR and non-empty message. | — |
 | `send_message` | Send a message to a connected messaging platform, or list available targets. IMPORTANT: When the user asks to send to a specific channel or person (not just a bare platform name), call send_message(action='list') FIRST to see available tar… | — |
 
 ## `moa` toolset
@@ -159,5 +160,4 @@ This page documents the built-in Hermes tool registry as it exists in code. Avai
 | Tool | Description | Requires environment |
 |------|-------------|----------------------|
 | `text_to_speech` | Convert text to speech audio. Returns a MEDIA: path that the platform delivers as a voice message. On Telegram it plays as a voice bubble, on Discord/WhatsApp as an audio attachment. In CLI mode, saves to ~/voice-memos/. Voice and provider… | — |
-
 

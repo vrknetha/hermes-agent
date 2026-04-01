@@ -48,6 +48,7 @@ from gateway.platforms.base import (
     MessageType,
     SendResult,
 )
+from tools.relay_outbound import post_relay_outbound
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +56,7 @@ DEFAULT_HOST = "0.0.0.0"
 DEFAULT_PORT = 8644
 _INSECURE_NO_AUTH = "INSECURE_NO_AUTH"
 _DYNAMIC_ROUTES_FILENAME = "webhook_subscriptions.json"
+_SESSION_KEY_HEADER = "X-Webhook-Session-Key"
 
 
 def check_webhook_requirements() -> bool:
@@ -172,6 +174,9 @@ class WebhookAdapter(BasePlatformAdapter):
 
         if deliver_type == "github_comment":
             return await self._deliver_github_comment(content, delivery)
+
+        if deliver_type == "relay_http":
+            return await self._deliver_relay_http(content, delivery)
 
         # Cross-platform delivery (telegram, discord, etc.)
         if self.gateway_runner and deliver_type in (
@@ -380,9 +385,18 @@ class WebhookAdapter(BasePlatformAdapter):
             )
         self._seen_deliveries[delivery_id] = now
 
-        # Use delivery_id in session key so concurrent webhooks on the
-        # same route get independent agent runs (not queued/interrupted).
-        session_chat_id = f"webhook:{route_name}:{delivery_id}"
+        # Optional session-key header keeps thread continuity for callers
+        # that want sticky sessions while preserving default per-delivery
+        # isolation for existing integrations.
+        session_key = self._normalize_session_key(
+            request.headers.get(_SESSION_KEY_HEADER, "")
+        )
+        if session_key:
+            session_chat_id = f"webhook:{route_name}:{session_key}"
+        else:
+            # Use delivery_id in session key so concurrent webhooks on the
+            # same route get independent agent runs (not queued/interrupted).
+            session_chat_id = f"webhook:{route_name}:{delivery_id}"
 
         # Store delivery info for send() — consumed (popped) on delivery
         deliver_config = {
@@ -433,6 +447,14 @@ class WebhookAdapter(BasePlatformAdapter):
             },
             status=202,
         )
+
+    @staticmethod
+    def _normalize_session_key(raw_value: str) -> str:
+        value = (raw_value or "").strip()
+        if not value:
+            return ""
+        normalized = re.sub(r"[^a-zA-Z0-9:._-]", "_", value)
+        return normalized[:160]
 
     # ------------------------------------------------------------------
     # Signature validation
@@ -614,3 +636,59 @@ class WebhookAdapter(BasePlatformAdapter):
                 )
 
         return await adapter.send(chat_id, content)
+
+    async def _deliver_relay_http(
+        self, content: str, delivery: dict
+    ) -> SendResult:
+        """Deliver response via generic outbound relay HTTP endpoint."""
+        payload = delivery.get("payload", {}) if isinstance(delivery, dict) else {}
+        if not isinstance(payload, dict):
+            payload = {}
+
+        metadata = payload.get("metadata", {})
+        if not isinstance(metadata, dict):
+            metadata = {}
+
+        group_id = str(metadata.get("groupId", "")).strip()
+        conversation_id = str(metadata.get("conversationId", "")).strip() or None
+        sender_did = str(payload.get("sender_did", "")).strip()
+
+        if not group_id and not sender_did:
+            return SendResult(
+                success=False,
+                error=(
+                    "Cannot route relay_http reply: inbound payload is missing "
+                    "metadata.groupId and sender_did (direct replies require "
+                    "sender_did)."
+                ),
+            )
+
+        extra = delivery.get("deliver_extra", {}) if isinstance(delivery, dict) else {}
+        connector_base_url = None
+        if isinstance(extra, dict):
+            raw_url = str(extra.get("connector_base_url", "")).strip()
+            connector_base_url = raw_url or None
+
+        if group_id:
+            relay_result = await post_relay_outbound(
+                message=content,
+                group_id=group_id,
+                conversation_id=conversation_id,
+                connector_base_url=connector_base_url,
+            )
+        else:
+            relay_result = await post_relay_outbound(
+                message=content,
+                to_agent_did=sender_did,
+                conversation_id=conversation_id,
+                connector_base_url=connector_base_url,
+            )
+
+        if relay_result.get("success"):
+            return SendResult(success=True, raw_response=relay_result)
+
+        return SendResult(
+            success=False,
+            error=relay_result.get("error", "relay_http delivery failed"),
+            raw_response=relay_result,
+        )

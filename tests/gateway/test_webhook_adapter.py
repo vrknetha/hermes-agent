@@ -10,6 +10,7 @@ Covers:
 - Body size limits
 - INSECURE_NO_AUTH bypass
 - Session isolation for concurrent webhooks
+- Optional sticky session key header for thread continuity
 - Delivery info cleanup after send()
 - connect / disconnect lifecycle
 """
@@ -581,6 +582,62 @@ class TestSessionIsolation:
         ids = {ev.source.chat_id for ev in captured_events}
         assert len(ids) == 2, "Each delivery must have a unique session chat_id"
 
+    @pytest.mark.asyncio
+    async def test_session_key_header_reuses_same_session(self):
+        """X-Webhook-Session-Key pins events to one session chat_id."""
+        routes = {"ci": {"secret": _INSECURE_NO_AUTH, "prompt": "build"}}
+        adapter = _make_adapter(routes=routes)
+
+        captured_events = []
+
+        async def _capture(event):
+            captured_events.append(event)
+
+        adapter.handle_message = _capture
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            headers_1 = {
+                "X-GitHub-Delivery": "sess-111",
+                "X-Webhook-Session-Key": "group:alpha",
+            }
+            resp1 = await cli.post("/webhooks/ci", json={"ref": "main"}, headers=headers_1)
+            assert resp1.status == 202
+
+            headers_2 = {
+                "X-GitHub-Delivery": "sess-222",
+                "X-Webhook-Session-Key": "group:alpha",
+            }
+            resp2 = await cli.post("/webhooks/ci", json={"ref": "dev"}, headers=headers_2)
+            assert resp2.status == 202
+
+        await asyncio.sleep(0.05)
+
+        assert len(captured_events) == 2
+        ids = {ev.source.chat_id for ev in captured_events}
+        assert ids == {"webhook:ci:group:alpha"}
+
+    @pytest.mark.asyncio
+    async def test_session_key_header_keeps_idempotency_by_delivery_id(self):
+        """Duplicate delivery IDs are still dropped even with sticky session key."""
+        routes = {"ci": {"secret": _INSECURE_NO_AUTH, "prompt": "build"}}
+        adapter = _make_adapter(routes=routes)
+        adapter.handle_message = AsyncMock()
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            headers = {
+                "X-GitHub-Delivery": "dup-111",
+                "X-Webhook-Session-Key": "group:alpha",
+            }
+            first = await cli.post("/webhooks/ci", json={"ref": "main"}, headers=headers)
+            assert first.status == 202
+
+            duplicate = await cli.post("/webhooks/ci", json={"ref": "main"}, headers=headers)
+            assert duplicate.status == 200
+            body = await duplicate.json()
+            assert body["status"] == "duplicate"
+
 
 # ===================================================================
 # Delivery info cleanup
@@ -603,6 +660,53 @@ class TestDeliveryCleanup:
         result = await adapter.send(chat_id, "Agent response here")
         assert result.success is True
         assert chat_id not in adapter._delivery_info
+
+
+class TestRelayHttpDeliveryFailures:
+    @pytest.mark.asyncio
+    async def test_missing_connector_url_fails_without_send(self, monkeypatch):
+        monkeypatch.delenv("RELAY_CONNECTOR_BASE_URL", raising=False)
+        routes = {
+            "relay": {
+                "secret": _INSECURE_NO_AUTH,
+                "prompt": "x",
+                "deliver": "relay_http",
+            }
+        }
+        adapter = _make_adapter(routes=routes)
+        chat_id = "webhook:relay:d-1"
+        adapter._delivery_info[chat_id] = {
+            "deliver": "relay_http",
+            "deliver_extra": {},
+            "payload": {"sender_did": "did:example:alice"},
+        }
+
+        # Ensure top-level config fallback is empty in this test process.
+        with patch("tools.relay_outbound._load_config_connector_base_url", return_value=""):
+            result = await adapter.send(chat_id, "hello")
+
+        assert result.success is False
+        assert "Missing relay connector URL" in (result.error or "")
+
+    @pytest.mark.asyncio
+    async def test_missing_route_metadata_fails_before_http_call(self):
+        adapter = _make_adapter()
+        chat_id = "webhook:relay:d-2"
+        adapter._delivery_info[chat_id] = {
+            "deliver": "relay_http",
+            "deliver_extra": {},
+            "payload": {},
+        }
+
+        with patch(
+            "gateway.platforms.webhook.post_relay_outbound",
+            new=AsyncMock(return_value={"success": True}),
+        ) as relay_mock:
+            result = await adapter.send(chat_id, "hello")
+
+        assert result.success is False
+        assert "metadata.groupId and sender_did" in (result.error or "")
+        relay_mock.assert_not_awaited()
 
 
 # ===================================================================

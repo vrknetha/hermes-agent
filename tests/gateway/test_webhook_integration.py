@@ -11,6 +11,7 @@ import asyncio
 import hashlib
 import hmac
 import json
+from contextlib import asynccontextmanager
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -335,3 +336,110 @@ class TestGitHubCommentDelivery:
         )
         # Delivery info cleaned up
         assert chat_id not in adapter._delivery_info
+
+
+@asynccontextmanager
+async def _outbound_capture_server():
+    received: list[dict] = []
+
+    async def _capture(request: web.Request) -> web.Response:
+        received.append(await request.json())
+        return web.json_response({"ok": True})
+
+    app = web.Application()
+    app.router.add_post("/v1/outbound", _capture)
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", 0)
+    await site.start()
+
+    socket = site._server.sockets[0]  # noqa: SLF001
+    host, port = socket.getsockname()[:2]
+    base_url = f"http://{host}:{port}"
+    try:
+        yield base_url, received
+    finally:
+        await runner.cleanup()
+
+
+class TestRelayHttpDelivery:
+    @pytest.mark.asyncio
+    async def test_direct_reply_routes_to_sender_did(self, monkeypatch):
+        routes = {
+            "relay-direct": {
+                "secret": _INSECURE_NO_AUTH,
+                "prompt": "reply",
+                "deliver": "relay_http",
+            }
+        }
+        adapter = _make_adapter(routes)
+        adapter.handle_message = AsyncMock()
+
+        async with _outbound_capture_server() as (base_url, received):
+            monkeypatch.setenv("RELAY_CONNECTOR_BASE_URL", base_url)
+
+            app = _create_app(adapter)
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.post(
+                    "/webhooks/relay-direct",
+                    json={
+                        "sender_did": "did:example:alice",
+                        "metadata": {"conversationId": "conv-direct"},
+                    },
+                    headers={"X-GitHub-Delivery": "relay-direct-001"},
+                )
+                assert resp.status == 202
+
+            result = await adapter.send(
+                "webhook:relay-direct:relay-direct-001",
+                "hello direct",
+            )
+
+        assert result.success is True
+        assert len(received) == 1
+        assert received[0]["toAgentDid"] == "did:example:alice"
+        assert received[0]["groupId"] is None
+        assert received[0]["conversationId"] == "conv-direct"
+        assert received[0]["payload"]["content"] == "hello direct"
+
+    @pytest.mark.asyncio
+    async def test_group_reply_routes_to_group_id_and_preserves_conversation(self, monkeypatch):
+        routes = {
+            "relay-group": {
+                "secret": _INSECURE_NO_AUTH,
+                "prompt": "reply",
+                "deliver": "relay_http",
+            }
+        }
+        adapter = _make_adapter(routes)
+        adapter.handle_message = AsyncMock()
+
+        async with _outbound_capture_server() as (base_url, received):
+            monkeypatch.setenv("RELAY_CONNECTOR_BASE_URL", base_url)
+
+            app = _create_app(adapter)
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.post(
+                    "/webhooks/relay-group",
+                    json={
+                        "sender_did": "did:example:alice",
+                        "metadata": {
+                            "groupId": "group-123",
+                            "conversationId": "conv-group",
+                        },
+                    },
+                    headers={"X-GitHub-Delivery": "relay-group-001"},
+                )
+                assert resp.status == 202
+
+            result = await adapter.send(
+                "webhook:relay-group:relay-group-001",
+                "hello group",
+            )
+
+        assert result.success is True
+        assert len(received) == 1
+        assert received[0]["toAgentDid"] is None
+        assert received[0]["groupId"] == "group-123"
+        assert received[0]["conversationId"] == "conv-group"
